@@ -1393,14 +1393,28 @@
     const view = { lat: HOME.lat, lon: HOME.lon };
     const pins = $$('[data-pin]', root);
     const cards = $$('[data-card]', root);
+    const lines = $$('[data-line]', root);
     const wrap = root.closest('[data-globe-wrap]') || root;
     const sec = root.closest('.sec') || document;
-    const AUTO = reduceMotion ? 0 : .045;
-    let W = 0; let R = 0; let dpr = 1;
+    const AUTO = reduceMotion ? 0 : 4; // degrees per second (was ~2.7; owner, 30.09.2026: a little faster)
+    /* one label per point: the plaque, its anchor (offset from the point on a 620-px globe) and the side it lies on.
+       The order of the markup is the priority when plaques collide. */
+    const labels = cards.map((el, i) => ({
+      el, i, pin: pins[i], line: lines[i],
+      lat: parseFloat(el.dataset.lat), lon: parseFloat(el.dataset.lon),
+      ax: parseFloat(el.dataset.ax) || 0, ay: parseFloat(el.dataset.ay) || 0, side: el.dataset.side || 'r',
+      w: 0, h: 0, a: 0, vis: 0, x: 0, y: 0, hid: 0, flipped: false,
+    }));
+    let W = 0; let R = 0; let dpr = 1; let K = 1; let minX = 0; let maxX = 0;
+    const measure = () => { labels.forEach((l) => { l.w = l.el.offsetWidth; l.h = l.el.offsetHeight; }); };
     const size = () => {
       W = root.clientWidth || 1; dpr = Math.min(window.devicePixelRatio || 1, 2);
       canvas.width = Math.round(W * dpr); canvas.height = Math.round(W * dpr);
       R = Math.max(1, W / 2 - 4); // never negative (a hidden/zero-width block would break the radial gradient)
+      K = W / 620; // the whole composition scales with the globe: phones show the same picture, only smaller
+      root.style.setProperty('--gs', String(Math.max(.8, Math.min(1, K))));
+      const sw = wrap.clientWidth || W; minX = -(sw - W) / 2; maxX = W + (sw - W) / 2; // plaques fade before the stage cuts them
+      measure();
     };
     const rot = () => ({ cL: Math.cos(view.lon * D), sL: Math.sin(view.lon * D), cT: Math.cos(view.lat * D), sT: Math.sin(view.lat * D) });
     const proj = (lat, lon, r) => {
@@ -1410,7 +1424,7 @@
       const y2 = y * r.cT - z1 * r.sT; const z2 = y * r.sT + z1 * r.cT;
       return { x: W / 2 + R * x1, y: W / 2 - R * y2, z: z2 };
     };
-    const co = () => parseFloat(getComputedStyle(root).getPropertyValue('--co')) || 1;
+    let boostSet = []; let boostAt = 0; let now = 0; // plaques that go first for a while: the ones hidden the longest, or the tapped point
     const draw = () => {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, W, W);
@@ -1430,22 +1444,55 @@
         ctx.beginPath(); ctx.arc(c + R * x1, c - R * y2, r0 * (.5 + .5 * z2), 0, 6.2832); ctx.fill();
       }
       ctx.globalAlpha = 1;
-      const k = co();
-      pins.forEach((p, i) => {
-        const q = proj(parseFloat(p.dataset.lat), parseFloat(p.dataset.lon), r);
-        const vis = Math.max(0, Math.min(1, (q.z - .08) * 5));
-        p.style.left = q.x + 'px'; p.style.top = q.y + 'px'; p.style.opacity = String(vis);
-        const card = cards[i];
-        if (!card) return;
-        card.style.left = q.x + (parseFloat(card.dataset.dx) || 0) * k + 'px';
-        card.style.top = q.y + (parseFloat(card.dataset.dy) || 0) * k + 'px';
-        card.style.opacity = String(vis);
-        card.style.pointerEvents = vis > .5 ? 'auto' : 'none';
+      /* points, plaques and the lines between them. Plaques are placed by priority; one that would overlap a placed
+         plaque or cover another point fades out (its point stays). Every couple of seconds the visible point whose
+         plaque has been hidden the longest goes first, so on a phone the plaques take turns; a tap on a point shows
+         its plaque at once. A plaque never leaves the stage: a side one flips to the other side of its point. */
+      const small = W < 480;
+      const KA = small ? Math.max(K, .72) : K; // a phone keeps the plaques readable (>= 10 px), so their ring is a little wider than the globe's scale
+      labels.forEach((l) => {
+        const q = proj(l.lat, l.lon, r);
+        l.x = q.x; l.y = q.y; l.vis = Math.max(0, Math.min(1, (q.z - .08) * 5));
+        if (l.pin) { l.pin.style.left = q.x + 'px'; l.pin.style.top = q.y + 'px'; l.pin.style.opacity = String(l.vis); l.pin.style.pointerEvents = l.vis > .5 ? '' : 'none'; }
+      });
+      if (now > boostAt) {
+        boostAt = now + (small ? 1800 : 2600);
+        boostSet = labels.filter((l) => l.vis > .6 && l.a < .5).sort((p, q) => p.hid - q.hid).slice(0, small ? 3 : 1).map((l) => l.i);
+      } // empty when nothing is hidden: the order of the markup applies
+      const order = boostSet.map((i) => labels[i]).concat(labels.filter((l) => boostSet.indexOf(l.i) < 0));
+      const placed = [];
+      order.forEach((l) => {
+        let ax = l.x + l.ax * KA; const ay = l.y + l.ay * KA;
+        let left = l.side === 'r' ? ax : l.side === 'l' ? ax - l.w : ax - l.w / 2;
+        const top = l.side === 't' ? ay - l.h : l.side === 'b' ? ay : ay - l.h / 2;
+        let flipped = false;
+        if (l.side === 'r' && left + l.w > maxX - 2) { ax = l.x - l.ax * KA; left = ax - l.w; flipped = true; }
+        else if (l.side === 'l' && left < minX + 2 && l.x - l.ax * KA + l.w < maxX - 2 && !small) { ax = l.x - l.ax * KA; left = ax; flipped = true; }
+        left = Math.max(minX + 2, Math.min(maxX - l.w - 2, left));
+        if (flipped !== l.flipped) { l.flipped = flipped; l.a = 0; } // appears at the new place instead of jumping
+        const m = l.a > .5 ? 1 : 5; // a shown plaque keeps its place more easily than a hidden one takes it
+        let hit = placed.some((b) => left < b.r + m && left + l.w > b.l - m && top < b.b + m && top + l.h > b.t - m);
+        if (!hit && boostSet.indexOf(l.i) < 0 && !small) hit = labels.some((o) => o !== l && o.vis > .3 && o.x > left - 5 && o.x < left + l.w + 5 && o.y > top - 5 && o.y < top + l.h + 5);
+        const target = hit ? 0 : l.vis;
+        if (target > .05) placed.push({ l: left, t: top, r: left + l.w, b: top + l.h });
+        const was = l.a;
+        l.a += (target - l.a) * .18;
+        if (l.a < .004) l.a = 0;
+        if (was >= .5 && l.a < .5) l.hid = now;
+        l.el.style.left = left + 'px'; l.el.style.top = top + 'px';
+        l.el.style.opacity = l.a.toFixed(3);
+        l.el.style.pointerEvents = l.a > .5 ? 'auto' : 'none';
+        if (l.line) { // from the point to the nearest spot of the plaque
+          l.line.setAttribute('x1', l.x.toFixed(1)); l.line.setAttribute('y1', l.y.toFixed(1));
+          l.line.setAttribute('x2', Math.max(left, Math.min(left + l.w, l.x)).toFixed(1));
+          l.line.setAttribute('y2', Math.max(top, Math.min(top + l.h, l.y)).toFixed(1));
+          l.line.style.opacity = l.a.toFixed(3);
+        }
       });
     };
 
     /* drag to rotate (inertia), auto-rotation when idle, click a card to bring it to the front */
-    let dragging = false; let lx = 0; let ly = 0; let vel = 0; let moved = 0; let downCard = null;
+    let dragging = false; let lx = 0; let ly = 0; let vel = 0; let moved = 0; let downCard = null; let downPin = null;
     let idleAt = 0; let intro = false; let running = false; let raf = 0;
     const goTo = (lat, lon) => {
       idleAt = performance.now() + 6000; vel = 0;
@@ -1460,6 +1507,7 @@
       if (e.button) return;
       dragging = true; moved = 0; lx = e.clientX; ly = e.clientY; vel = 0;
       downCard = e.target instanceof Element ? e.target.closest('[data-card]') : null;
+      downPin = e.target instanceof Element ? e.target.closest('[data-pin]') : null;
       root.classList.add('is-drag');
       try { root.setPointerCapture(e.pointerId); } catch { /* ignore */ }
     });
@@ -1474,28 +1522,35 @@
       if (!dragging) return;
       dragging = false; root.classList.remove('is-drag');
       if (downCard && moved < 6) goTo(parseFloat(downCard.dataset.lat), parseFloat(downCard.dataset.lon));
-      downCard = null; idleAt = performance.now() + 4000;
+      else if (downPin && moved < 6) { // a tap on a point: its plaque goes first for five seconds, the globe holds still
+        const idx = pins.indexOf(downPin);
+        if (idx >= 0) { boostSet = [idx]; boostAt = now + 5000; idleAt = performance.now() + 5000; vel = 0; downCard = null; downPin = null; return; }
+      }
+      downCard = null; downPin = null; idleAt = performance.now() + 4000;
     };
     root.addEventListener('pointerup', up); root.addEventListener('pointercancel', up);
     cards.forEach((card) => card.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goTo(parseFloat(card.dataset.lat), parseFloat(card.dataset.lon)); } }));
+    let last = 0;
     const loop = (t) => {
+      const dt = last ? Math.min(.05, (t - last) / 1000) : 0; last = t; now = t;
       if (!dragging && !intro) {
-        if (Math.abs(vel) > .02) { view.lon += vel; vel *= .93; } else if (t > idleAt) view.lon += AUTO;
+        if (Math.abs(vel) > .02) { view.lon += vel; vel *= .93; } else if (t > idleAt) view.lon += AUTO * dt; // the same speed on any display
       }
       draw();
       raf = requestAnimationFrame(loop);
     };
-    const start = () => { if (!running) { running = true; raf = requestAnimationFrame(loop); } };
+    const start = () => { if (!running) { running = true; last = 0; raf = requestAnimationFrame(loop); } };
     const stop = () => { running = false; cancelAnimationFrame(raf); };
     size(); draw();
     let rt = 0;
     window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => { size(); draw(); }, 80); });
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { measure(); draw(); }); // plaque widths change when the web font arrives
 
     /* appearance: counter, globe rises and spins into place, pins drop in, cards fade in */
     const animate = hasGsap && !reduceMotion;
     const pinIns = $$('.gpin__in', root); const cardIns = $$('.gcard__in', root);
     const numEl0 = $('[data-globe-num]', sec);
-    if (animate) { window.gsap.set(wrap, { autoAlpha: 0 }); window.gsap.set(pinIns, { scale: 0, transformOrigin: '50% 100%' }); window.gsap.set(cardIns, { autoAlpha: 0 }); if (numEl0) numEl0.textContent = '0'; }
+    if (animate) { window.gsap.set(wrap, { autoAlpha: 0 }); window.gsap.set(pinIns, { scale: 0, transformOrigin: '50% 50%' }); window.gsap.set(cardIns, { autoAlpha: 0 }); if (numEl0) numEl0.textContent = '0'; }
     let appeared = false;
     const appear = () => {
       if (appeared) return;
@@ -1512,10 +1567,10 @@
       tl.fromTo(wrap, { y: 160, autoAlpha: 0 }, { y: 0, autoAlpha: 1, duration: 1.4, ease: 'power3.out' }, .1);
       const r = { lon: HOME.lon - 90 }; view.lon = r.lon;
       tl.to(r, { lon: HOME.lon, duration: 2.1, ease: 'power3.out', onUpdate: () => { view.lon = r.lon; } }, .1);
-      tl.fromTo(pinIns, { scale: 0 }, { scale: 1, duration: .6, ease: 'back.out(2.4)', stagger: .22 }, 1.3);
-      tl.fromTo(cardIns, { autoAlpha: 0, y: 14 }, { autoAlpha: 1, y: 0, duration: .6, stagger: .22, ease: 'power3.out' }, 1.45);
+      tl.fromTo(pinIns, { scale: 0 }, { scale: 1, duration: .6, ease: 'back.out(2.4)', stagger: .07 }, 1.3);
+      tl.fromTo(cardIns, { autoAlpha: 0, y: 10 }, { autoAlpha: 1, y: 0, duration: .5, stagger: .07, ease: 'power3.out' }, 1.45);
     };
-    root.__globe = { view, appear, draw }; // debug hook
+    root.__globe = { view, appear, draw, tick: (ms) => { now += ms; draw(); } }; // debug hook (tick = let the plaques' clock run without the frame loop)
     let visible = !document.hidden; let inView = false;
     const sync = () => { if (visible && inView) { start(); appear(); } else stop(); };
     document.addEventListener('visibilitychange', () => { visible = !document.hidden; sync(); });
